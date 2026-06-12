@@ -1,0 +1,51 @@
+@tailwind base;
+@tailwind components;
+@tailwind utilities;
+
+:root {
+  font-family: Inter, system-ui, -apple-system, sans-serif;
+  -webkit-font-smoothing: antialiased;
+  -moz-osx-font-smoothing: grayscale;
+}
+
+* {
+  box-sizing: border-box;
+}
+
+body {
+  margin: 0;
+  overflow: hidden;
+  background: #f8fafc;
+}
+
+#root {
+  width: 100%;
+  height: 100dvh;
+  height: 100vh; /* fallback */
+}
+
+/* Geocoder styles removed — now using custom SearchBox component */
+
+/* Mapbox map controls */
+.mapboxgl-ctrl-group {
+  border-radius: 12px !important;
+  overflow: hidden;
+  box-shadow: 0 2px 12px rgba(0,0,0,0.15) !important;
+}
+
+.mapboxgl-ctrl button {
+  width: 36px !important;
+  height: 36px !important;
+}
+
+/* Scrollbar styling */
+::-webkit-scrollbar {
+  width: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: #d1fae5;
+  border-radius: 4px;
+}
