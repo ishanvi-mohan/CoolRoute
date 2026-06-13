@@ -1,63 +1,101 @@
 import { useEffect, useRef, useState } from 'react';
-import mapboxgl from 'mapbox-gl';
-import 'mapbox-gl/dist/mapbox-gl.css';
 
 interface MapProps {
-  onMapLoad?: (map: mapboxgl.Map) => void;
+  onMapLoad?: (map: any) => void;
+}
+
+const GOOGLE_API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string;
+
+// Module-level loading state so multiple Map instances share one script load
+let _scriptLoaded = false;
+let _scriptLoading = false;
+const _pendingCallbacks: Array<() => void> = [];
+
+function loadGoogleMaps(): Promise<void> {
+  return new Promise((resolve) => {
+    if (_scriptLoaded) { resolve(); return; }
+    _pendingCallbacks.push(resolve);
+    if (_scriptLoading) return;
+    _scriptLoading = true;
+
+    const script = document.createElement('script');
+    script.src = `https://maps.googleapis.com/maps/api/js?key=${GOOGLE_API_KEY}`;
+    script.async = true;
+    script.defer = true;
+    script.onload = () => {
+      _scriptLoaded = true;
+      _pendingCallbacks.forEach((cb) => cb());
+      _pendingCallbacks.length = 0;
+    };
+    document.head.appendChild(script);
+  });
 }
 
 const Map = ({ onMapLoad }: MapProps) => {
-  const mapContainer = useRef<HTMLDivElement>(null);
-  const map = useRef<mapboxgl.Map | null>(null);
+  const containerRef = useRef<HTMLDivElement>(null);
+  const mapRef       = useRef<any>(null);
   const [mapLoaded, setMapLoaded] = useState(false);
 
   useEffect(() => {
-    if (map.current) return;
+    if (mapRef.current) return;
 
-    const mapboxToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN;
-    if (!mapboxToken) return;
+    loadGoogleMaps().then(() => {
+      if (mapRef.current || !containerRef.current) return;
 
-    mapboxgl.accessToken = mapboxToken;
+      const g = (window as any).google;
+      const map = new g.maps.Map(containerRef.current, {
+        center: { lat: 22.3193, lng: 114.1694 }, // Hong Kong default
+        zoom: 14,
+        mapTypeControl: false,
+        streetViewControl: false,
+        fullscreenControl: false,
+        gestureHandling: 'greedy', // single-finger pan on mobile
+        zoomControlOptions: {
+          position: g.maps.ControlPosition.RIGHT_TOP,
+        },
+      });
 
-    map.current = new mapboxgl.Map({
-      container: mapContainer.current!,
-      style: 'mapbox://styles/mapbox/streets-v12',
-      center: [-122.4194, 37.7749],
-      zoom: 12,
-    });
-
-    map.current.addControl(new mapboxgl.NavigationControl(), 'top-right');
-
-    const geolocateControl = new mapboxgl.GeolocateControl({
-      positionOptions: { enableHighAccuracy: true },
-      trackUserLocation: true,
-      showUserHeading: true,
-    });
-    map.current.addControl(geolocateControl, 'top-right');
-
-    map.current.on('load', () => {
+      mapRef.current = map;
       setMapLoaded(true);
-      if (onMapLoad && map.current) onMapLoad(map.current);
-      geolocateControl.trigger();
-    });
+      onMapLoad?.(map);
 
-    // Resize map when its container changes dimensions
-    // (critical: fixes the half-black-map issue on first render)
-    const resizeObserver = new ResizeObserver(() => {
-      map.current?.resize();
+      // Pan to user's location and add blue dot
+      if ('geolocation' in navigator) {
+        navigator.geolocation.getCurrentPosition(
+          (pos) => {
+            const latLng = { lat: pos.coords.latitude, lng: pos.coords.longitude };
+            map.setCenter(latLng);
+            new g.maps.Marker({
+              position: latLng,
+              map,
+              title: 'Your location',
+              icon: {
+                path: g.maps.SymbolPath.CIRCLE,
+                fillColor: '#4285F4',
+                fillOpacity: 1,
+                strokeColor: '#ffffff',
+                strokeWeight: 2,
+                scale: 8,
+              },
+              zIndex: 999,
+            });
+          },
+          undefined,
+          { enableHighAccuracy: true, timeout: 10000 }
+        );
+      }
     });
-    if (mapContainer.current) resizeObserver.observe(mapContainer.current);
 
     return () => {
-      resizeObserver.disconnect();
-      map.current?.remove();
-      map.current = null;
+      // Don't destroy the map on cleanup — just clear the ref
+      // so Strict Mode's second run can reinitialise cleanly
+      mapRef.current = null;
     };
   }, [onMapLoad]);
 
   return (
     <div className="relative w-full h-full">
-      <div ref={mapContainer} className="absolute inset-0" />
+      <div ref={containerRef} className="absolute inset-0" />
       {!mapLoaded && (
         <div className="absolute inset-0 flex flex-col items-center justify-center bg-emerald-50 gap-3">
           <div className="w-10 h-10 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin" />

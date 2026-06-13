@@ -1,150 +1,138 @@
-import { useState, useRef, useCallback, useEffect } from 'react';
-import mapboxgl from 'mapbox-gl';
+import { useState, useRef, useCallback } from 'react';
 import Map from './components/Map';
-import RouteInput from './components/RouteInput';
-import RouteResults from './components/RouteResults';
+import NavigationHUD from './components/NavigationHUD';
+import { SearchScreen } from './components/SearchScreen';
+import { RouteSelectionScreen } from './components/RouteSelectionScreen';
 import { calculateRoute } from './services/api';
 import type { Location } from './types/location';
 import type { Route, RouteComparison } from './types/route';
 
-const SHADED_LAYER   = 'shaded-route-layer';
-const SHADED_SOURCE  = 'shaded-route-source';
-const SHORTEST_LAYER  = 'shortest-route-layer';
-const SHORTEST_SOURCE = 'shortest-route-source';
+type Screen = 'search' | 'routes' | 'navigation';
 
-function routeToCoords(route: Route | undefined): [number, number][] {
+function routeToLatLngs(route: Route | undefined) {
+  if (route?.polyline?.length) return route.polyline;
   if (!route?.segments?.length) return [];
   return route.segments.flatMap((s) => [
-    [s.start.lng, s.start.lat],
-    [s.end.lng,   s.end.lat],
+    { lat: s.start.lat, lng: s.start.lng },
+    { lat: s.end.lat,   lng: s.end.lng   },
   ]);
 }
 
 function App() {
-  const mapboxToken = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN || '';
-  const [startLocation, setStartLocation]   = useState<Location | null>(null);
-  const [destLocation,  setDestLocation]    = useState<Location | null>(null);
-  const [comparison,    setComparison]      = useState<RouteComparison | null>(null);
-  const [selectedRoute, setSelectedRoute]   = useState<'shaded' | 'shortest'>('shaded');
-  const [isCalculating, setIsCalculating]   = useState(false);
-  const [error,         setError]           = useState<string | undefined>();
-  const [panelExpanded, setPanelExpanded]   = useState(false);
+  const [screen,        setScreen]        = useState<Screen>('search');
+  const [startLocation, setStartLocation] = useState<Location | null>(null);
+  const [destLocation,  setDestLocation]  = useState<Location | null>(null);
+  const [comparison,    setComparison]    = useState<RouteComparison | null>(null);
+  const [selectedRoute, setSelectedRoute] = useState<'shaded' | 'shortest'>('shaded');
+  const [isCalculating, setIsCalculating] = useState(false);
+  const [error,         setError]         = useState<string | undefined>();
+  const [sheetExpanded, setSheetExpanded] = useState(false);
 
-  const mapRef      = useRef<mapboxgl.Map | null>(null);
-  const markersRef  = useRef<mapboxgl.Marker[]>([]);
+  const mapRef        = useRef<any>(null);
+  const polylinesRef  = useRef<any[]>([]);
+  const markersRef    = useRef<any[]>([]);
+  const userMarkerRef = useRef<any>(null);
 
-  useEffect(() => {
-    if (comparison || error) setPanelExpanded(true);
-  }, [comparison, error]);
+  const handleMapLoad = useCallback((map: any) => { mapRef.current = map; }, []);
 
-  const handleMapLoad = useCallback((map: mapboxgl.Map) => {
-    mapRef.current = map;
+  const handleNavigationPosition = useCallback((pos: Location, heading: number | null) => {
+    const map = mapRef.current;
+    if (!map) return;
+    const g = (window as any).google;
+    const p = { lat: pos.lat, lng: pos.lng };
+
+    // Live "you are here" dot that follows the device, like Google Maps.
+    if (g) {
+      if (!userMarkerRef.current) {
+        userMarkerRef.current = new g.maps.Marker({
+          position: p,
+          map,
+          zIndex: 30,
+          icon: {
+            path: g.maps.SymbolPath.CIRCLE,
+            fillColor: '#1a5fb4',
+            fillOpacity: 1,
+            strokeColor: '#fff',
+            strokeWeight: 3,
+            scale: 8,
+          },
+        });
+      } else {
+        userMarkerRef.current.setPosition(p);
+      }
+    }
+
+    map.panTo(p);
+    if (heading !== null && g) map.setHeading(heading);
+    if (map.getZoom() < 17) map.setZoom(17);
   }, []);
 
-  // Re-draw whenever the user switches routes
-  useEffect(() => {
-    if (!comparison || !mapRef.current) return;
-    drawRoutes(mapRef.current, comparison, selectedRoute);
-  }, [selectedRoute, comparison]);
+  const clearUserMarker = useCallback(() => {
+    if (userMarkerRef.current) { userMarkerRef.current.setMap(null); userMarkerRef.current = null; }
+  }, []);
 
-  function clearMapRoutes(map: mapboxgl.Map) {
-    [SHADED_LAYER, SHORTEST_LAYER].forEach((id) => {
-      if (map.getLayer(id)) map.removeLayer(id);
-    });
-    [SHADED_SOURCE, SHORTEST_SOURCE].forEach((id) => {
-      if (map.getSource(id)) map.removeSource(id);
-    });
-    markersRef.current.forEach((m) => m.remove());
-    markersRef.current = [];
+  function clearMapOverlays() {
+    polylinesRef.current.forEach((p) => p.setMap(null)); polylinesRef.current = [];
+    markersRef.current.forEach((m) => m.setMap(null));   markersRef.current   = [];
   }
 
-  function drawRoutes(
-    map: mapboxgl.Map,
-    comp: RouteComparison,
-    active: 'shaded' | 'shortest'
-  ) {
-    clearMapRoutes(map);
+  function drawRoutes(map: any, comp: RouteComparison, active: 'shaded' | 'shortest') {
+    clearMapOverlays();
+    const g = (window as any).google;
+    if (!g) return;
 
-    const shadedCoords   = routeToCoords(comp.shadedRoute);
-    const shortestCoords = routeToCoords(comp.shortestRoute);
+    const shadedPath   = routeToLatLngs(comp.shadedRoute);
+    const shortestPath = routeToLatLngs(comp.shortestRoute);
 
-    // Draw the non-selected route first (behind)
     if (!comp.isSameRoute) {
-      const bgRoute   = active === 'shaded' ? comp.shortestRoute : comp.shadedRoute;
-      const bgCoords  = active === 'shaded' ? shortestCoords : shadedCoords;
-      const bgSource  = active === 'shaded' ? SHORTEST_SOURCE : SHADED_SOURCE;
-      const bgLayer   = active === 'shaded' ? SHORTEST_LAYER  : SHADED_LAYER;
-      const bgColor   = active === 'shaded' ? '#94a3b8' : '#10b981'; // slate / emerald
-
-      map.addSource(bgSource, {
-        type: 'geojson',
-        data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: bgCoords } },
-      });
-      map.addLayer({
-        id: bgLayer, type: 'line', source: bgSource,
-        layout: { 'line-join': 'round', 'line-cap': 'round' },
-        paint: { 'line-color': bgColor, 'line-width': 4, 'line-opacity': 0.4, 'line-dasharray': [2, 2] },
-      });
-
-      void bgRoute; // suppress unused var warning
+      const bgPath  = active === 'shaded' ? shortestPath : shadedPath;
+      const bgColor = active === 'shaded' ? '#94a3b8' : '#1a5fb4';
+      polylinesRef.current.push(new g.maps.Polyline({
+        path: bgPath, strokeColor: bgColor, strokeWeight: 4, strokeOpacity: 0,
+        icons: [{ icon: { path: 'M 0,-1 0,1', strokeOpacity: 0.4, strokeColor: bgColor, scale: 3 }, offset: '0', repeat: '14px' }],
+        map,
+      }));
     }
 
-    // Draw the active route on top
-    const fgCoords = active === 'shaded' ? shadedCoords : shortestCoords;
-    const fgSource = active === 'shaded' ? SHADED_SOURCE  : SHORTEST_SOURCE;
-    const fgLayer  = active === 'shaded' ? SHADED_LAYER   : SHORTEST_LAYER;
-    const fgColor  = active === 'shaded' ? '#10b981' : '#3b82f6'; // emerald / blue
+    const fgPath  = active === 'shaded' ? shadedPath : shortestPath;
+    const fgColor = active === 'shaded' ? '#1a5fb4' : '#0ea5b0';
+    polylinesRef.current.push(new g.maps.Polyline({ path: fgPath, strokeColor: fgColor, strokeWeight: 5, strokeOpacity: 0.9, map }));
 
-    map.addSource(fgSource, {
-      type: 'geojson',
-      data: { type: 'Feature', properties: {}, geometry: { type: 'LineString', coordinates: fgCoords } },
-    });
-    map.addLayer({
-      id: fgLayer, type: 'line', source: fgSource,
-      layout: { 'line-join': 'round', 'line-cap': 'round' },
-      paint: { 'line-color': fgColor, 'line-width': 5, 'line-opacity': 0.9 },
-    });
-
-    // Markers
+    // Start point shown as a hollow origin ring — the solid blue dot is the
+    // live current-location marker that tracks the device during navigation.
     if (startLocation) {
-      const m = new mapboxgl.Marker({ color: '#10b981' })
-        .setLngLat([startLocation.lng, startLocation.lat])
-        .addTo(map);
-      markersRef.current.push(m);
+      markersRef.current.push(new g.maps.Marker({
+        position: { lat: startLocation.lat, lng: startLocation.lng }, map,
+        icon: { path: g.maps.SymbolPath.CIRCLE, fillColor: '#fff', fillOpacity: 1, strokeColor: '#1a5fb4', strokeWeight: 3, scale: 6 }, zIndex: 9,
+      }));
     }
     if (destLocation) {
-      const m = new mapboxgl.Marker({ color: '#ef4444' })
-        .setLngLat([destLocation.lng, destLocation.lat])
-        .addTo(map);
-      markersRef.current.push(m);
+      markersRef.current.push(new g.maps.Marker({
+        position: { lat: destLocation.lat, lng: destLocation.lng }, map,
+        icon: { path: g.maps.SymbolPath.CIRCLE, fillColor: '#0d1520', fillOpacity: 1, strokeColor: '#fff', strokeWeight: 2, scale: 9 }, zIndex: 10,
+      }));
     }
 
-    // Fit bounds to the active route
-    const bounds = new mapboxgl.LngLatBounds();
-    fgCoords.forEach((c) => bounds.extend(c));
+    const bounds = new g.maps.LatLngBounds();
+    fgPath.forEach((p: any) => bounds.extend(p));
     if (!comp.isSameRoute) {
-      const bgCoords2 = active === 'shaded' ? shortestCoords : shadedCoords;
-      bgCoords2.forEach((c) => bounds.extend(c));
+      (active === 'shaded' ? shortestPath : shadedPath).forEach((p: any) => bounds.extend(p));
     }
-    map.fitBounds(bounds, { padding: { top: 80, bottom: 320, left: 60, right: 60 } });
+    map.fitBounds(bounds, { top: 80, bottom: 320, left: 40, right: 40 });
   }
 
-  const handleCalculateRoute = async () => {
-    if (!startLocation || !destLocation) return;
+  const handleSearch = async (start: Location, dest: Location) => {
+    setStartLocation(start);
+    setDestLocation(dest);
     setIsCalculating(true);
     setError(undefined);
     setComparison(null);
     setSelectedRoute('shaded');
-    setPanelExpanded(true);
 
     try {
-      const result = await calculateRoute({
-        start: startLocation,
-        destination: destLocation,
-        timestamp: new Date(),
-      });
+      const result = await calculateRoute({ start, destination: dest, timestamp: new Date() });
       setComparison(result);
-      if (mapRef.current) drawRoutes(mapRef.current, result, 'shaded');
+      setScreen('routes');
     } catch (err) {
       setError(err instanceof Error ? err.message : 'Failed to calculate route');
     } finally {
@@ -154,88 +142,86 @@ function App() {
 
   const handleSelectRoute = (route: 'shaded' | 'shortest') => {
     setSelectedRoute(route);
+    setScreen('navigation');
+    // Draw route on map after a tick (map needs to be visible first)
+    setTimeout(() => {
+      if (mapRef.current && comparison) drawRoutes(mapRef.current, comparison, route);
+    }, 100);
   };
 
-  if (!mapboxToken) {
-    return (
-      <div className="flex items-center justify-center h-screen bg-emerald-50">
-        <div className="text-center p-8 bg-white rounded-2xl shadow-lg max-w-sm mx-4">
-          <div className="text-4xl mb-3">🌳</div>
-          <h1 className="text-xl font-bold text-gray-900 mb-2">Coolroute</h1>
-          <p className="text-gray-500 text-sm mb-4">
-            Add your Mapbox token to <code className="bg-gray-100 px-1.5 py-0.5 rounded text-xs">.env</code>
-          </p>
-          <pre className="text-left bg-gray-50 border border-gray-200 p-3 rounded-xl text-xs text-gray-700">
-            VITE_MAPBOX_ACCESS_TOKEN=pk...
-          </pre>
-        </div>
-      </div>
-    );
-  }
+  const activeRoute = (): Route | null => {
+    if (!comparison) return null;
+    return selectedRoute === 'shaded' ? comparison.shadedRoute : comparison.shortestRoute;
+  };
 
   return (
-    <div className="relative w-screen overflow-hidden bg-gray-200" style={{ height: '100dvh' }}>
-      {/* Full-screen map */}
-      <div className="absolute inset-0">
+    <div className="relative w-screen overflow-hidden" style={{ height: '100dvh' }}>
+
+      {/* Map — always mounted so it stays loaded; only visible during navigation */}
+      <div className={`absolute inset-0 ${screen === 'navigation' ? 'z-0' : '-z-10 invisible'}`}>
         <Map onMapLoad={handleMapLoad} />
       </div>
 
-      {/* Panel: bottom sheet (mobile) / left sidebar (desktop) */}
-      <div
-        className={[
-          'absolute bg-white flex flex-col overflow-hidden z-10',
-          'left-0 right-0 bottom-0',
-          'rounded-t-3xl shadow-[0_-4px_40px_rgba(0,0,0,0.18)]',
-          'transition-[max-height] duration-300 ease-in-out',
-          panelExpanded ? 'max-h-[88dvh] max-h-[88vh]' : 'max-h-[52dvh] max-h-[52vh]',
-          'md:top-0 md:bottom-0 md:left-0 md:right-auto md:w-[380px]',
-          'md:rounded-none md:rounded-r-2xl',
-          'md:shadow-[4px_0_40px_rgba(0,0,0,0.12)]',
-          'md:max-h-none',
-        ].join(' ')}
-      >
-        {/* Drag handle (mobile) */}
-        <div
-          className="flex justify-center pt-3 pb-1 md:hidden cursor-pointer flex-shrink-0"
-          onClick={() => setPanelExpanded((v) => !v)}
-        >
-          <div className="w-10 h-1 bg-gray-300 rounded-full" />
+      {/* ── Screen 1: Search ── */}
+      {screen === 'search' && (
+        <div className="absolute inset-0 overflow-y-auto" style={{ WebkitOverflowScrolling: 'touch' } as React.CSSProperties}>
+          <SearchScreen
+            onSearch={handleSearch}
+            isCalculating={isCalculating}
+            error={error}
+          />
         </div>
+      )}
 
-        {/* Branding */}
-        <div className="px-5 pt-1 pb-3 md:pt-6 md:pb-4 border-b border-gray-100 flex-shrink-0">
-          <div className="flex items-center gap-2.5">
-            <div className="w-9 h-9 bg-emerald-500 rounded-xl flex items-center justify-center flex-shrink-0">
-              <span className="text-lg">🌳</span>
-            </div>
-            <div>
-              <h1 className="text-base font-bold text-gray-900 leading-tight">Coolroute</h1>
-              <p className="text-xs text-gray-400">Shade-optimized pedestrian routing</p>
-            </div>
+      {/* ── Screen 2: Route selection ── */}
+      {screen === 'routes' && comparison && (
+        <div className="absolute inset-0 overflow-y-auto" style={{ WebkitOverflowScrolling: 'touch' } as React.CSSProperties}>
+          <RouteSelectionScreen
+            comparison={comparison}
+            fromName={startLocation?.name ?? 'Start'}
+            toName={destLocation?.name ?? 'Destination'}
+            onBack={() => setScreen('search')}
+            onSelect={handleSelectRoute}
+          />
+        </div>
+      )}
+
+      {/* ── Screen 3: Navigation (map + bottom HUD) ── */}
+      {screen === 'navigation' && activeRoute() && (
+        <div
+          className={`absolute left-0 right-0 bottom-0 flex flex-col rounded-t-3xl overflow-hidden transition-[height] duration-300 ease-out ${sheetExpanded ? 'h-[82dvh]' : 'h-[22dvh]'}`}
+          style={{ background: '#fff', boxShadow: '0 -4px 40px rgba(13,21,32,0.12)', zIndex: 10 }}
+        >
+          {/* Grab handle — tap to expand/collapse. Collapsed, the map fills ~78%. */}
+          <button
+            onClick={() => setSheetExpanded((v) => !v)}
+            className="flex flex-col items-center gap-1 pt-2.5 pb-1.5 flex-shrink-0"
+            aria-label={sheetExpanded ? 'Collapse details' : 'Expand details'}
+          >
+            <div className="w-10 h-1 rounded-full" style={{ background: 'var(--muted-foreground)', opacity: 0.4 }} />
+            <span className="text-xs flex items-center gap-1" style={{ color: 'var(--muted-foreground)', fontFamily: "'JetBrains Mono', monospace" }}>
+              <svg width="11" height="11" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth="2.4" strokeLinecap="round" strokeLinejoin="round" style={{ transform: sheetExpanded ? 'rotate(180deg)' : 'none', transition: 'transform 0.3s' }}>
+                <path d="M18 15l-6-6-6 6" />
+              </svg>
+              {sheetExpanded ? 'Hide' : 'Details'}
+            </span>
+          </button>
+
+          {/* NavigationHUD fills the sheet (it scrolls internally) */}
+          <div className="flex-1 min-h-0 overflow-hidden">
+            <NavigationHUD
+              route={activeRoute()!}
+              onStop={() => {
+                clearUserMarker();
+                setSheetExpanded(false);
+                setScreen('search');
+                if (mapRef.current) mapRef.current.setHeading(0);
+              }}
+              onPositionUpdate={handleNavigationPosition}
+            />
           </div>
         </div>
-
-        {/* Scrollable content */}
-        <div className="flex-1 overflow-y-auto overscroll-contain">
-          <RouteInput
-            onStartChange={setStartLocation}
-            onDestinationChange={setDestLocation}
-            onCalculateRoute={handleCalculateRoute}
-            isCalculating={isCalculating}
-          />
-
-          {(comparison || isCalculating || error) && (
-            <RouteResults
-              comparison={comparison}
-              isCalculating={isCalculating}
-              error={error}
-              selectedRoute={selectedRoute}
-              onSelectRoute={handleSelectRoute}
-              onRecalculate={handleCalculateRoute}
-            />
-          )}
-        </div>
-      </div>
+      )}
     </div>
   );
 }

@@ -1,48 +1,43 @@
 /**
- * Custom destination search using Mapbox Search Box API v1.
- * Replaces @mapbox/mapbox-gl-geocoder which uses the older v5 Geocoding API
- * and has much poorer POI / address coverage.
+ * Destination search using Google Places Autocomplete API (New).
  */
 import { useState, useRef, useEffect, useCallback } from 'react';
 import type { Location } from '../types/location';
 
-interface Suggestion {
-  mapbox_id: string;
-  name: string;
-  full_address?: string;
-  place_formatted?: string;
-  feature_type: string;
+interface PlaceSuggestion {
+  placeId: string;
+  mainText: string;
+  secondaryText: string;
 }
 
 interface SearchBoxProps {
   placeholder?: string;
   proximity?: { lat: number; lng: number } | null;
   onSelect: (location: Location) => void;
+  /** When true, renders without a search icon — for embedding inside a row */
+  compact?: boolean;
 }
 
-const SESSION_TOKEN = crypto.randomUUID();
+const API_KEY = import.meta.env.VITE_GOOGLE_MAPS_API_KEY as string;
+const AUTOCOMPLETE_URL = 'https://places.googleapis.com/v1/places:autocomplete';
 
 export default function SearchBox({
   placeholder = 'Where do you want to go?',
   proximity,
   onSelect,
+  compact = false,
 }: SearchBoxProps) {
-  const [query, setQuery]             = useState('');
-  const [suggestions, setSuggestions] = useState<Suggestion[]>([]);
-  const [loading, setLoading]         = useState(false);
-  const [open, setOpen]               = useState(false);
-  const [activeIdx, setActiveIdx]     = useState(-1);
-  const [, setSelected]       = useState('');
+  const [query,       setQuery]       = useState('');
+  const [suggestions, setSuggestions] = useState<PlaceSuggestion[]>([]);
+  const [loading,     setLoading]     = useState(false);
+  const [open,        setOpen]        = useState(false);
+  const [activeIdx,   setActiveIdx]   = useState(-1);
   const debounceRef = useRef<ReturnType<typeof setTimeout> | null>(null);
   const wrapperRef  = useRef<HTMLDivElement>(null);
-  const token = import.meta.env.VITE_MAPBOX_ACCESS_TOKEN as string;
 
-  // Close on outside click
   useEffect(() => {
     const handler = (e: MouseEvent) => {
-      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) {
-        setOpen(false);
-      }
+      if (wrapperRef.current && !wrapperRef.current.contains(e.target as Node)) setOpen(false);
     };
     document.addEventListener('mousedown', handler);
     return () => document.removeEventListener('mousedown', handler);
@@ -50,104 +45,93 @@ export default function SearchBox({
 
   const suggest = useCallback(async (q: string) => {
     if (q.length < 2) { setSuggestions([]); setOpen(false); return; }
-
     setLoading(true);
     try {
-      const params = new URLSearchParams({
-        q,
-        access_token: token,
-        session_token: SESSION_TOKEN,
-        limit: '10',
-        language: navigator.language,
-        // All feature types for maximum coverage
-        types: 'country,region,district,postcode,locality,place,neighborhood,street,address,poi,poi.landmark,poi.restaurant,poi.hotel',
-        ...(proximity ? { proximity: `${proximity.lng},${proximity.lat}` } : {}),
+      const body: Record<string, unknown> = { input: q };
+      if (proximity) {
+        body.locationBias = {
+          circle: { center: { latitude: proximity.lat, longitude: proximity.lng }, radius: 50000 },
+        };
+      }
+      const res = await fetch(AUTOCOMPLETE_URL, {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'X-Goog-Api-Key': API_KEY,
+          'X-Goog-FieldMask': [
+            'suggestions.placePrediction.placeId',
+            'suggestions.placePrediction.structuredFormat',
+          ].join(','),
+        },
+        body: JSON.stringify(body),
       });
-
-      const res = await fetch(
-        `https://api.mapbox.com/search/searchbox/v1/suggest?${params}`
-      );
-      if (!res.ok) throw new Error('Suggest failed');
+      if (!res.ok) throw new Error('Autocomplete failed');
       const data = await res.json();
-      setSuggestions(data.suggestions ?? []);
-      setOpen(true);
+      const items: PlaceSuggestion[] = (data.suggestions ?? []).map((s: any) => {
+        const p = s.placePrediction;
+        return {
+          placeId:       p.placeId,
+          mainText:      p.structuredFormat?.mainText?.text      ?? p.text?.text ?? '',
+          secondaryText: p.structuredFormat?.secondaryText?.text ?? '',
+        };
+      });
+      setSuggestions(items);
+      setOpen(items.length > 0);
       setActiveIdx(-1);
     } catch {
       setSuggestions([]);
     } finally {
       setLoading(false);
     }
-  }, [token, proximity]);
+  }, [proximity]);
 
   const handleInput = (e: React.ChangeEvent<HTMLInputElement>) => {
     const val = e.target.value;
     setQuery(val);
-    setSelected('');
     if (debounceRef.current) clearTimeout(debounceRef.current);
     debounceRef.current = setTimeout(() => suggest(val), 250);
   };
 
-  const retrieve = async (suggestion: Suggestion) => {
+  const retrieve = async (suggestion: PlaceSuggestion) => {
     try {
-      const params = new URLSearchParams({
-        access_token: token,
-        session_token: SESSION_TOKEN,
-      });
       const res = await fetch(
-        `https://api.mapbox.com/search/searchbox/v1/retrieve/${suggestion.mapbox_id}?${params}`
+        `https://places.googleapis.com/v1/places/${suggestion.placeId}`,
+        { headers: { 'X-Goog-Api-Key': API_KEY, 'X-Goog-FieldMask': 'location,displayName,formattedAddress' } }
       );
-      if (!res.ok) throw new Error('Retrieve failed');
+      if (!res.ok) throw new Error('Place details failed');
       const data = await res.json();
-      const feature = data.features?.[0];
-      if (!feature) return;
-
-      const [lng, lat] = feature.geometry.coordinates as [number, number];
-      const name = feature.properties?.full_address || suggestion.full_address || suggestion.name;
-
-      setQuery(suggestion.name);
-      setSelected(name);
+      const { latitude: lat, longitude: lng } = data.location;
+      const name = data.formattedAddress || data.displayName?.text || suggestion.mainText;
+      setQuery(suggestion.mainText);
       setSuggestions([]);
       setOpen(false);
       onSelect({ lat, lng, name });
-    } catch {
-      // silently fail
+    } catch (err) {
+      console.error('Place details fetch failed:', err);
     }
   };
 
   const handleKeyDown = (e: React.KeyboardEvent) => {
     if (!open || suggestions.length === 0) return;
-    if (e.key === 'ArrowDown') {
-      e.preventDefault();
-      setActiveIdx((i) => Math.min(i + 1, suggestions.length - 1));
-    } else if (e.key === 'ArrowUp') {
-      e.preventDefault();
-      setActiveIdx((i) => Math.max(i - 1, 0));
-    } else if (e.key === 'Enter' && activeIdx >= 0) {
-      e.preventDefault();
-      retrieve(suggestions[activeIdx]);
-    } else if (e.key === 'Escape') {
-      setOpen(false);
-    }
-  };
-
-  const featureIcon = (type: string) => {
-    if (type.startsWith('poi')) return '📍';
-    if (type === 'address' || type === 'street') return '🏠';
-    if (type === 'place' || type === 'locality') return '🏙️';
-    if (type === 'neighborhood') return '🗺️';
-    return '📌';
+    if (e.key === 'ArrowDown') { e.preventDefault(); setActiveIdx((i) => Math.min(i + 1, suggestions.length - 1)); }
+    else if (e.key === 'ArrowUp') { e.preventDefault(); setActiveIdx((i) => Math.max(i - 1, 0)); }
+    else if (e.key === 'Enter' && activeIdx >= 0) { e.preventDefault(); retrieve(suggestions[activeIdx]); }
+    else if (e.key === 'Escape') setOpen(false);
   };
 
   return (
     <div ref={wrapperRef} className="relative w-full">
       <div className="relative">
-        <svg
-          className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 text-gray-400 pointer-events-none"
-          fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
-        >
-          <circle cx="11" cy="11" r="7" />
-          <path d="M21 21l-4.35-4.35" strokeLinecap="round" />
-        </svg>
+        {!compact && (
+          <svg
+            className="absolute left-3 top-1/2 -translate-y-1/2 w-4 h-4 pointer-events-none"
+            style={{ color: 'var(--muted-foreground)' }}
+            fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}
+          >
+            <circle cx="11" cy="11" r="7" />
+            <path d="M21 21l-4.35-4.35" strokeLinecap="round" />
+          </svg>
+        )}
 
         <input
           type="text"
@@ -157,51 +141,54 @@ export default function SearchBox({
           onFocus={() => suggestions.length > 0 && setOpen(true)}
           placeholder={placeholder}
           autoComplete="off"
-          className={[
-            'w-full pl-9 pr-9 py-[11px] text-[15px] rounded-xl border-[1.5px]',
-            'bg-gray-50 text-gray-900 placeholder-gray-400',
-            'focus:outline-none focus:bg-white transition-colors',
-            open ? 'border-emerald-500 ring-[3px] ring-emerald-500/10' : 'border-gray-200',
-          ].join(' ')}
+          className="w-full bg-transparent outline-none text-sm"
+          style={{
+            color: 'var(--foreground)',
+            paddingLeft: compact ? 0 : '2rem',
+            paddingRight: query ? '1.5rem' : 0,
+          }}
         />
 
-        {/* Spinner / clear */}
-        <div className="absolute right-3 top-1/2 -translate-y-1/2">
-          {loading ? (
-            <div className="w-4 h-4 rounded-full border-2 border-emerald-400 border-t-transparent animate-spin" />
-          ) : query ? (
-            <button
-              onMouseDown={(e) => { e.preventDefault(); setQuery(''); setSuggestions([]); setOpen(false); setSelected(''); }}
-              className="text-gray-400 hover:text-gray-600"
-            >
-              <svg className="w-4 h-4" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
-                <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
-              </svg>
-            </button>
-          ) : null}
-        </div>
+        {query && (
+          <button
+            onMouseDown={(e) => { e.preventDefault(); setQuery(''); setSuggestions([]); setOpen(false); }}
+            className="absolute right-0 top-1/2 -translate-y-1/2 p-0.5"
+            style={{ color: 'var(--muted-foreground)' }}
+          >
+            <svg className="w-3.5 h-3.5" viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}>
+              <path d="M18 6 6 18M6 6l12 12" strokeLinecap="round" />
+            </svg>
+          </button>
+        )}
+
+        {loading && (
+          <div className="absolute right-0 top-1/2 -translate-y-1/2">
+            <div className="w-3.5 h-3.5 rounded-full border-2 border-t-transparent animate-spin" style={{ borderColor: 'var(--primary)', borderTopColor: 'transparent' }} />
+          </div>
+        )}
       </div>
 
-      {/* Suggestions dropdown */}
+      {/* Dropdown — rendered outside the row via absolute positioning */}
       {open && suggestions.length > 0 && (
-        <ul className="absolute z-50 mt-1.5 w-full bg-white rounded-xl border border-gray-200 shadow-xl overflow-hidden">
+        <ul
+          className="absolute z-50 mt-2 w-full rounded-2xl overflow-hidden"
+          style={{ background: '#fff', border: '1px solid var(--border)', boxShadow: '0 8px 32px rgba(13,21,32,0.12)' }}
+        >
           {suggestions.map((s, i) => (
-            <li key={s.mapbox_id}>
+            <li key={s.placeId} style={{ borderTop: i > 0 ? '1px solid var(--border)' : 'none' }}>
               <button
                 onMouseDown={(e) => { e.preventDefault(); retrieve(s); }}
-                className={[
-                  'w-full text-left flex items-start gap-3 px-3 py-2.5 transition-colors',
-                  i === activeIdx ? 'bg-emerald-50' : 'hover:bg-gray-50',
-                  i > 0 ? 'border-t border-gray-100' : '',
-                ].join(' ')}
+                className="w-full text-left flex items-start gap-3 px-4 py-3 transition-colors"
+                style={{ background: i === activeIdx ? 'var(--secondary)' : 'transparent' }}
               >
-                <span className="text-base mt-0.5 flex-shrink-0">{featureIcon(s.feature_type)}</span>
+                <svg className="w-4 h-4 flex-shrink-0 mt-0.5" style={{ color: 'var(--muted-foreground)' }} fill="none" viewBox="0 0 24 24" stroke="currentColor" strokeWidth={2}>
+                  <path d="M12 2C8.13 2 5 5.13 5 9c0 5.25 7 13 7 13s7-7.75 7-13c0-3.87-3.13-7-7-7z" />
+                  <circle cx="12" cy="9" r="2.5" />
+                </svg>
                 <div className="min-w-0">
-                  <p className="text-sm font-medium text-gray-900 truncate">{s.name}</p>
-                  {(s.place_formatted || s.full_address) && (
-                    <p className="text-xs text-gray-400 truncate mt-0.5">
-                      {s.place_formatted || s.full_address}
-                    </p>
+                  <p className="text-sm font-medium truncate" style={{ color: 'var(--foreground)' }}>{s.mainText}</p>
+                  {s.secondaryText && (
+                    <p className="text-xs truncate mt-0.5" style={{ color: 'var(--muted-foreground)' }}>{s.secondaryText}</p>
                   )}
                 </div>
               </button>
@@ -210,10 +197,12 @@ export default function SearchBox({
         </ul>
       )}
 
-      {/* No results hint */}
       {open && !loading && suggestions.length === 0 && query.length >= 2 && (
-        <div className="absolute z-50 mt-1.5 w-full bg-white rounded-xl border border-gray-200 shadow-xl px-4 py-3">
-          <p className="text-sm text-gray-400">No results for "{query}"</p>
+        <div
+          className="absolute z-50 mt-2 w-full rounded-2xl px-4 py-3"
+          style={{ background: '#fff', border: '1px solid var(--border)' }}
+        >
+          <p className="text-sm" style={{ color: 'var(--muted-foreground)' }}>No results for "{query}"</p>
         </div>
       )}
     </div>

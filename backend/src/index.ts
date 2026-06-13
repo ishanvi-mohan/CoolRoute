@@ -1,3 +1,9 @@
+// Node 17+ uses Happy Eyeballs (tries IPv4 + IPv6 simultaneously).
+// If IPv6 routing is unavailable, all connections throw AggregateError.
+// Force IPv4-first to prevent this.
+import { setDefaultResultOrder } from 'node:dns';
+setDefaultResultOrder('ipv4first');
+
 import dotenv from 'dotenv';
 import { resolve } from 'path';
 import { cwd } from 'process';
@@ -25,7 +31,7 @@ if (rootResult.error) {
   console.log(`   ⚠️  Root .env error: ${rootResult.error.message}`);
 }
 
-console.log(`   MAPBOX_ACCESS_TOKEN: ${process.env.MAPBOX_ACCESS_TOKEN ? '✓ Set' : '✗ Not set'}`);
+console.log(`   GOOGLE_MAPS_API_KEY: ${process.env.GOOGLE_MAPS_API_KEY ? '✓ Set' : '✗ Not set'}`);
 console.log(`   OPENWEATHER_API_KEY: ${process.env.OPENWEATHER_API_KEY ? '✓ Set' : '✗ Not set'}`);
 
 const PORT = process.env.PORT || 3001;

@@ -5,10 +5,14 @@ export interface RouteSegment {
   end: Location;
   distance: number;
   shadeScore: number;
+  bearing: number;
+  shadedSide: 'left' | 'right' | 'either';
 }
 
 export interface Route {
   segments: RouteSegment[];
+  /** Road-following lat/lng points decoded from the encoded polyline */
+  polyline: Location[];
   totalDistance: number;
   estimatedTime: number;
   shadeCoverage: number;

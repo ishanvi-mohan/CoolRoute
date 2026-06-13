@@ -1,28 +1,38 @@
 import { RouteRequest, Route, RouteComparison, RouteSegment } from '../types/route.js';
+import type { OsmBuilding } from '../types/building.js';
 import { calculateSunPosition, isNighttime } from '../utils/sunPosition.js';
 import {
+  calculateBuildingShadeCoverage,
   calculateStreetOrientationShade,
   getTimeOfDayBonus,
+  getShadedSide,
 } from '../utils/shadeCalculations.js';
 import { getUVIndex } from './weather.js';
-import { getWalkingRoutes, MapboxRoute } from './mapbox.js';
+import { getWalkingRoutes, GoogleRoute } from './googleMaps.js';
+import { fetchBuildingsNearRoute } from './overpass.js';
+import { getBearing } from '../utils/sunPosition.js';
 
-const AVERAGE_WALKING_SPEED = 5; // km/h
-const MAX_DETOUR_PERCENTAGE = 0.2; // 20% max detour constraint
+const AVERAGE_WALKING_SPEED  = 5;   // km/h
+const MAX_DETOUR_PERCENTAGE  = 0.2; // 20%
 
 interface ScoredRoute {
-  route: MapboxRoute;
+  route: GoogleRoute;
   segments: RouteSegment[];
   totalDistance: number;
   shadeCoverage: number;
   avgShadeScore: number;
 }
 
-function buildRouteObject(scored: ScoredRoute, shortestDistance: number, uvIndex: number): Route {
+function buildRouteObject(
+  scored: ScoredRoute,
+  shortestDistance: number,
+  uvIndex: number
+): Route {
   const detourDistance = scored.totalDistance - shortestDistance;
-  const estimatedTime = (scored.totalDistance / 1000 / AVERAGE_WALKING_SPEED) * 60;
+  const estimatedTime  = (scored.totalDistance / 1000 / AVERAGE_WALKING_SPEED) * 60;
   return {
-    segments: scored.segments,
+    segments:      scored.segments,
+    polyline:      scored.route.polyline,
     totalDistance: scored.totalDistance,
     estimatedTime,
     shadeCoverage: scored.shadeCoverage,
@@ -36,127 +46,149 @@ export async function calculateShadeOptimizedRoute(
 ): Promise<RouteComparison> {
   const { start, destination, timestamp } = request;
 
-  const nighttime = isNighttime(start.lat, start.lng, timestamp);
-  const uvIndex = await getUVIndex(start.lat, start.lng);
+  const nighttime       = isNighttime(start.lat, start.lng, timestamp);
+  const uvIndex         = await getUVIndex(start.lat, start.lng);
   const skipOptimization = nighttime || uvIndex < 3;
 
   if (skipOptimization) {
-    console.log('Nighttime or low UV - shade optimization skipped');
+    console.log('Nighttime or low UV — using shortest route without shade optimisation');
   }
 
-  const mapboxRoutes = await getWalkingRoutes(
-    start.lng,
-    start.lat,
-    destination.lng,
-    destination.lat
+  const googleRoutes = await getWalkingRoutes(
+    start.lng, start.lat,
+    destination.lng, destination.lat
   );
 
-  if (mapboxRoutes.length === 0) {
-    throw new Error('No routes found');
-  }
+  if (googleRoutes.length === 0) throw new Error('No routes found');
 
   const sunPosition = calculateSunPosition(start.lat, start.lng, timestamp);
-  const timeBonus = getTimeOfDayBonus(timestamp.getHours());
+  const timeBonus   = getTimeOfDayBonus(timestamp.getHours());
 
-  const scoredRoutes: ScoredRoute[] = mapboxRoutes.map((route) =>
-    scoreRouteForShade(route, sunPosition, timeBonus)
+  // ── Fetch buildings once for all routes ────────────────────────────────
+  // Collect all segments across every candidate route for a single Overpass call.
+  // Fall back to orientation heuristic if Overpass fails (fetchBuildingsNearRoute
+  // never throws — it returns [] on error).
+  // Only endpoints are needed to compute the Overpass bounding box, so this is
+  // intentionally a narrower shape than RouteSegment (no bearing/shadedSide).
+  const allSegments: Pick<RouteSegment, 'start' | 'end'>[] = googleRoutes.flatMap((r) =>
+    r.steps.map((s) => ({
+      start: { lat: s.startLat, lng: s.startLng },
+      end:   { lat: s.endLat,   lng: s.endLng   },
+    }))
   );
 
-  // Shortest route = minimum distance
+  let buildings: OsmBuilding[] = [];
+  if (!skipOptimization) {
+    buildings = await fetchBuildingsNearRoute(allSegments);
+  }
+
+  const useBuildingData = buildings.length > 0;
+  console.log(
+    useBuildingData
+      ? `Using building shadows (${buildings.length} buildings)`
+      : 'No building data — using orientation heuristic'
+  );
+
+  // ── Score each candidate route ──────────────────────────────────────────
+  const scoredRoutes: ScoredRoute[] = googleRoutes.map((route) =>
+    scoreRouteForShade(route, sunPosition, timeBonus, buildings, useBuildingData)
+  );
+
+  // Shortest route by distance
   const shortestScored = scoredRoutes.reduce((min, r) =>
     r.totalDistance < min.totalDistance ? r : min
   );
-  const shortestDistance = shortestScored.totalDistance;
+  const shortestDistance   = shortestScored.totalDistance;
   const maxAllowedDistance = shortestDistance * (1 + MAX_DETOUR_PERCENTAGE);
 
-  // Best shaded route = highest shade score within 20% constraint
+  // Best shaded route within 20% detour constraint
   let shadedScored: ScoredRoute;
   if (skipOptimization) {
     shadedScored = shortestScored;
   } else {
-    // Sort by shade score descending, pick first that fits constraint
     const byShade = [...scoredRoutes].sort((a, b) => b.avgShadeScore - a.avgShadeScore);
-    const withinConstraint = byShade.find((r) => r.totalDistance <= maxAllowedDistance);
-    shadedScored = withinConstraint ?? shortestScored;
+    shadedScored  = byShade.find((r) => r.totalDistance <= maxAllowedDistance) ?? shortestScored;
   }
 
-  const isSameRoute = shadedScored === shortestScored ||
+  const isSameRoute =
+    shadedScored === shortestScored ||
     Math.abs(shadedScored.totalDistance - shortestScored.totalDistance) < 1;
 
   return {
-    shadedRoute: buildRouteObject(shadedScored, shortestDistance, uvIndex),
+    shadedRoute:   buildRouteObject(shadedScored,  shortestDistance, uvIndex),
     shortestRoute: buildRouteObject(shortestScored, shortestDistance, uvIndex),
     isSameRoute,
   };
 }
 
 function scoreRouteForShade(
-  route: MapboxRoute,
-  sunPosition: { altitude: number; azimuth: number },
-  timeBonus: number
+  route:            GoogleRoute,
+  sunPosition:      { altitude: number; azimuth: number },
+  timeBonus:        number,
+  buildings:        OsmBuilding[],
+  useBuildingData:  boolean
 ): ScoredRoute {
   const segments: RouteSegment[] = [];
   let totalShadeScore = 0;
 
-  const steps = route.legs[0]?.steps || [];
+  for (const step of route.steps) {
+    let baseShadeScore: number;
 
-  for (const step of steps) {
-    if (step.geometry.coordinates.length < 2) continue;
-
-    const coords = step.geometry.coordinates;
-    const startCoord = coords[0];
-    const endCoord = coords[coords.length - 1];
-
-    const baseShadeScore = calculateStreetOrientationShade(
-      startCoord[1],
-      startCoord[0],
-      endCoord[1],
-      endCoord[0],
-      sunPosition
-    );
+    if (useBuildingData) {
+      baseShadeScore = calculateBuildingShadeCoverage(
+        step.startLat, step.startLng,
+        step.endLat,   step.endLng,
+        buildings,
+        sunPosition
+      );
+    } else {
+      baseShadeScore = calculateStreetOrientationShade(
+        step.startLat, step.startLng,
+        step.endLat,   step.endLng,
+        sunPosition
+      );
+    }
 
     const shadeScore = Math.min(1, baseShadeScore + timeBonus);
     totalShadeScore += shadeScore * step.distance;
 
+    const bearing    = getBearing(step.startLat, step.startLng, step.endLat, step.endLng);
+    const shadedSide = getShadedSide(
+      step.startLat, step.startLng,
+      step.endLat,   step.endLng,
+      bearing, buildings, sunPosition
+    );
+
     segments.push({
-      start: { lat: startCoord[1], lng: startCoord[0] },
-      end: { lat: endCoord[1], lng: endCoord[0] },
+      start: { lat: step.startLat, lng: step.startLng },
+      end:   { lat: step.endLat,   lng: step.endLng   },
       distance: step.distance,
       shadeScore,
+      bearing,
+      shadedSide,
     });
   }
 
   if (segments.length === 0) {
-    const coords = route.geometry.coordinates;
-    const startCoord = coords[0];
-    const endCoord = coords[coords.length - 1];
-
-    const shadeScore = calculateStreetOrientationShade(
-      startCoord[1],
-      startCoord[0],
-      endCoord[1],
-      endCoord[0],
-      sunPosition
-    );
-
+    const fallback = 0.5;
     segments.push({
-      start: { lat: startCoord[1], lng: startCoord[0] },
-      end: { lat: endCoord[1], lng: endCoord[0] },
+      start: { lat: route.steps[0]?.startLat ?? 0, lng: route.steps[0]?.startLng ?? 0 },
+      end:   { lat: route.steps[0]?.endLat   ?? 0, lng: route.steps[0]?.endLng   ?? 0 },
       distance: route.distance,
-      shadeScore: Math.min(1, shadeScore + timeBonus),
+      shadeScore: fallback,
+      bearing: 0,
+      shadedSide: 'either',
     });
-
-    totalShadeScore = shadeScore * route.distance;
+    totalShadeScore = fallback * route.distance;
   }
 
-  const avgShadeScore = totalShadeScore / route.distance;
-  const shadeCoverage = Math.round(avgShadeScore * 100);
+  const avgShadeScore = route.distance > 0 ? totalShadeScore / route.distance : 0;
 
   return {
     route,
     segments,
     totalDistance: route.distance,
-    shadeCoverage,
+    shadeCoverage: Math.round(avgShadeScore * 100),
     avgShadeScore,
   };
 }

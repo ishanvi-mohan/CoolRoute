@@ -14,10 +14,16 @@ export interface RouteSegment {
   end: Location;
   distance: number;
   shadeScore: number;
+  /** Compass bearing of this segment in degrees (0–360) */
+  bearing: number;
+  /** Which side of the street is shadier based on sun position */
+  shadedSide: 'left' | 'right' | 'either';
 }
 
 export interface Route {
   segments: RouteSegment[];
+  /** Decoded lat/lng points following actual road geometry */
+  polyline: Location[];
   totalDistance: number;
   estimatedTime: number;
   shadeCoverage: number;
